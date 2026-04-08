@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # =============================================================================
 # Modern plain-text todo manager
-# Enhanced fzf integration
+# Enhanced with fzf and bat
 # =============================================================================
 
 # Prevent accidental sourcing
 if [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then
-    echo "Error: This script should not be sourced. Run it directly with 'todo' or 't'" >&2
+    echo "Error: This script should be executed, not sourced. Use 'todo' or 't'." >&2
     return 1 2>/dev/null || exit 1
 fi
 
@@ -17,132 +17,178 @@ set -o pipefail
 TODO_DIR="${TODO_DIR:-$HOME/todo}"
 TODO_FILE="${TODO_FILE:-$TODO_DIR/todo.txt}"
 DONE_FILE="${DONE_FILE:-$TODO_DIR/done.txt}"
-ARCHIVE_FILE="${ARCHIVE_FILE:-$TODO_DIR/archive.txt}"
 
 mkdir -p "$TODO_DIR"
-touch "$TODO_FILE" "$DONE_FILE" "$ARCHIVE_FILE" 2>/dev/null || true
+touch "$DONE_FILE" 2>/dev/null || true
 
-# Colors
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-BLUE='\033[0;34m'
-NC='\033[0m'
+# Create todo.txt with header if empty
+if [[ ! -s "$TODO_FILE" ]]; then
+    cat > "$TODO_FILE" << 'EOF'
+# todo.txt — YYYY-MM-DD [ ] [x]=done [!]=urgent *** Task #project @context
+===============================================================================
+2026-04-08 [ ] **  Finish setting up new dotfiles          #dotfiles @computer
+2026-04-09 [ ] *   Review monthly budget                   #finance @home
+2026-04-15 [!] *** Prepare presentation for team meeting   #work
+2026-04-10 [ ] *   Buy groceries                           #errands @supermarket
+2026-04-08 [ ] **  Backup important documents              #backup
+EOF
+    echo -e "\033[0;32m✓ Created todo.txt with header and examples\033[0m"
+fi
+
+# =============================================================================
+# Functions
+# =============================================================================
+
+add_task() {
+    # Remove the first argument ("add" or "a") if present
+    if [[ "$1" == "add" || "$1" == "a" ]]; then
+        shift
+    fi
+
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: todo add \"Task #project @context ★\""
+        return 1
+    fi
+
+    local task="$*"
+    local complexity="  "   # default padding (for no stars)
+
+    # Detect complexity stars only if they are at the very end
+    if [[ "$task" =~ \*\*\*$ ]]; then
+        complexity="***"
+        task="${task%\*\*\*}"
+    elif [[ "$task" =~ \*\*$ ]]; then
+        complexity=" **"
+        task="${task%\*\*}"
+    elif [[ "$task" =~ \*[[:space:]]*$ || "$task" =~ \*$ ]]; then
+        complexity="  *"
+        task="${task%\*}"
+    fi
+
+    # Trim trailing whitespace
+    task="${task%"${task##*[![:space:]]}"}"
+
+    # Add the task with proper formatting: date [ ]   complexity   Task ...
+    echo "$(date +%Y-%m-%d) [ ] $complexity  $task" >> "$TODO_FILE"
+    echo -e "\033[0;32m✓ Task added\033[0m"
+}
+
+# Mark task as done ([ ] or [!] → [x]) — only marks, does not move
+do_task() {
+    local num="$1"
+
+    if [[ -z "$num" ]]; then
+        echo "Usage: todo do <number>"
+        return 1
+    fi
+
+    if ! [[ "$num" =~ ^[0-9]+$ ]]; then
+        echo -e "\033[0;31m✗ Task number must be a positive integer\033[0m"
+        return 1
+    fi
+
+    # Skip 2 header lines
+    local real_line=$((num + 2))
+
+    if sed -i '' "${real_line}s/\[.\]/[x]/" "$TODO_FILE" 2>/dev/null; then
+        echo -e "\033[0;32m✓ Task $num marked as done\033[0m"
+    else
+        echo -e "\033[0;31m✗ Failed to mark task $num as done\033[0m"
+        return 1
+    fi
+}
+
+rm_task() {
+    local num="$1"
+    if [[ -z "$num" ]]; then
+        echo "Usage: todo rm <number>"
+        return 1
+    fi
+
+    if ! [[ "$num" =~ ^[0-9]+$ ]]; then
+        echo -e "\033[0;31m✗ Task number must be a positive integer\033[0m"
+        return 1
+    fi
+
+    local real_line=$((num + 2))
+
+    if sed -i '' "${real_line}d" "$TODO_FILE" 2>/dev/null; then
+        echo -e "\033[0;33mTask $num deleted\033[0m"
+    else
+        echo -e "\033[0;31m✗ Failed to delete task $num\033[0m"
+        return 1
+    fi
+}
 
 usage() {
     cat <<EOF
 Usage: todo [command]
 
-Commands:
-  ls                    List all tasks (with fzf preview)
-  add, a <task>         Add new task
-  do, d <number>        Mark task as done
-  rm <number>           Delete task
-  f, fzf                Interactive fuzzy finder (default when no args)
-  pri <number> <A|B|C>  Set priority
-  archive               Archive all done tasks
-  edit, e               Open todo.txt in nano
-  help                  Show help
+  ls         List tasks using bat
+  add <task> Add new task
+  do <num>   Mark task as done
+  rm <num>   Delete task
+  urgent <num> Mark as urgent
+  edit       Open todo.txt in nano
+  help       Show help
 
-Examples:
-  todo                  → opens fzf interactively
-  todo add "Finish report +work @computer due:2026-04-20"
-  todo f +work          → fuzzy search only +work project
-  todo f @errands       → fuzzy search only @errands context
+No arguments = open fzf interactively
 EOF
 }
 
-# -----------------------------
-# Interactive fzf mode (main feature)
-# -----------------------------
-fzf_mode() {
-    local filter="$1"
-
-    if ! command -v fzf >/dev/null 2>&1; then
-        echo "fzf is not installed. Falling back to simple list."
-        nl -w 2 -s '. ' "$TODO_FILE"
-        return
-    fi
-
-    local preview_cmd="echo {} | sed 's/^[0-9]\+\. //' | fold -s -w 80"
-
-    local selected
-    selected=$(nl -w 2 -s '. ' "$TODO_FILE" \
-        | fzf --height 70% \
-              --reverse \
-              --ansi \
-              --prompt="todo > " \
-              --header="ENTER=complete | CTRL-D=delete | CTRL-E=edit | ESC=quit" \
-              --bind="enter:execute-silent($0 do {1})+reload(nl -w 2 -s '. ' $TODO_FILE)" \
-              --bind="ctrl-d:execute-silent($0 rm {1})+reload(nl -w 2 -s '. ' $TODO_FILE)" \
-              --bind="ctrl-e:execute($0 edit)+abort" \
-              --preview="$preview_cmd" \
-              --preview-window=right:50% \
-              -q "$filter") || return 0
-}
-
-# -----------------------------
-# Main dispatcher
-# -----------------------------
 case "${1:-}" in
-    ""|f|fzf)
-        shift
-        fzf_mode "$*"
+    "")
+        # Default: fzf
+        if command -v fzf >/dev/null 2>&1; then
+            tail -n +3 "$TODO_FILE" | nl -w 3 -s '  ' \
+                | fzf --height 75% --reverse --ansi \
+                    --prompt="todo > " \
+                    --header="ENTER=mark done  CTRL-D=delete  CTRL-E=edit" \
+                    --bind="enter:execute-silent(todo do {1})+reload(tail -n +3 $TODO_FILE | nl -w 3 -s '  ')" \
+                    --bind="ctrl-d:execute-silent(todo rm {1})+reload(tail -n +3 $TODO_FILE | nl -w 3 -s '  ')" \
+                    --bind="ctrl-e:execute(todo edit)+abort" \
+                    --preview="echo {} | sed 's/^[0-9 ]\+//' | bat " \
+                    --preview-window=right:60%
+        else
+            bat "$TODO_FILE"
+        fi
         ;;
 
     ls|list|l)
-        if [[ -s "$TODO_FILE" ]]; then
-            nl -w 2 -s '. ' "$TODO_FILE" | sed "s/+[^ ]*/${YELLOW}&${NC}/g; s/@[^ ]*/${BLUE}&${NC}/g"
-        else
-            echo "No active tasks. You're all caught up! 🎉"
-        fi
+        bat "$TODO_FILE"
         ;;
 
     add|a)
-        shift
-        [[ $# -eq 0 ]] && { echo "Usage: todo add \"Task +project @context\""; exit 1; }
-        echo "$(date +%Y-%m-%d) $*" >> "$TODO_FILE"
-        echo -e "${GREEN}✓ Task added${NC}"
+        add_task "$@"
         ;;
 
     do|d|done)
-        [[ -z "${2:-}" ]] && { echo "Usage: todo do <number>"; exit 1; }
-        local num=$2
-        if sed -i.bak "${num}d" "$TODO_FILE" 2>/dev/null; then
-            local task=$(sed -n "${num}p" "$TODO_FILE.bak" 2>/dev/null)
-            echo "$(date +%Y-%m-%d) $task" >> "$DONE_FILE"
-            rm -f "$TODO_FILE.bak"
-            echo -e "${GREEN}✓ Task $num completed${NC}"
-        else
-            echo -e "${RED}✗ Invalid task number${NC}"
-        fi
+        do_task "$2"
         ;;
 
-    rm|del|remove)
-        [[ -z "${2:-}" ]] && { echo "Usage: todo rm <number>"; exit 1; }
-        sed -i.bak "${2}d" "$TODO_FILE" 2>/dev/null && rm -f "$TODO_FILE.bak"
-        echo -e "${YELLOW}Task $2 deleted${NC}"
+    rm|del)
+        rm_task "$2"
         ;;
 
-    pri)
-        [[ -z "${2:-}" || -z "${3:-}" ]] && { echo "Usage: todo pri <number> <A|B|C>"; exit 1; }
-        sed -i.bak "${2}s/^/\(${3}\)/" "$TODO_FILE" 2>/dev/null && rm -f "$TODO_FILE.bak"
-        echo -e "${YELLOW}Priority set to (${3}) for task $2${NC}"
-        ;;
-
-    archive|arc)
-        if [[ ! -s "$DONE_FILE" ]]; then
-            echo "No completed tasks to archive."
-            exit 0
-        fi
-        cat "$DONE_FILE" >> "$ARCHIVE_FILE"
-        local count=$(wc -l < "$DONE_FILE")
-        > "$DONE_FILE"
-        echo -e "${GREEN}✓ Archived $count task(s)${NC}"
+    urgent|!)
+        [[ -z "${2:-}" ]] && { echo "Usage: todo urgent <number>"; exit 1; }
+        local real_line=$((2 + 2))
+        sed -i '' "${real_line}s/\[ \]/[!]/" "$TODO_FILE" 2>/dev/null
+        echo -e "\033[0;31m[!] Task $2 marked as urgent\033[0m"
         ;;
 
     edit|e)
         ${EDITOR:-nano} "$TODO_FILE"
+        ;;
+
+    archive|arc)
+        if ! grep -q '^\[x\]' "$TODO_FILE" 2>/dev/null; then
+            echo "No completed tasks to archive."
+            exit 0
+        fi
+        grep '^\[x\]' "$TODO_FILE" >> "$DONE_FILE"
+        sed -i '' '/^\[x\]/d' "$TODO_FILE"
+        echo -e "\033[0;32m✓ Archived all completed tasks\033[0m"
         ;;
 
     help|-h|--help)
